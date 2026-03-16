@@ -49,9 +49,78 @@ const uint8_t PWMB_channel = 1;
 const uint32_t PWM_freq = 5000;
 const uint8_t PWM_resolution = 8; // 8-bit -> 0..255
 
+// ── Encoder pins (Pololu 5157 – quadrature, 12 CPR) ─────────────────────────
+// GPIO 34-39 are input-only on ESP32 and are well-suited for encoder signals.
+const int ENC_A_RIGHT = 34; // Right motor encoder channel A
+const int ENC_B_RIGHT = 35; // Right motor encoder channel B
+const int ENC_A_LEFT  = 36; // Left motor encoder channel A
+const int ENC_B_LEFT  = 39; // Left motor encoder channel B
+
+volatile long encoderCountRight = 0;
+volatile long encoderCountLeft  = 0;
+
+// ISRs – called on rising edge of channel A; channel B gives direction
+void IRAM_ATTR rightEncoderISR() {
+  if (digitalRead(ENC_B_RIGHT) == HIGH) encoderCountRight++;
+  else                                   encoderCountRight--;
+}
+void IRAM_ATTR leftEncoderISR() {
+  if (digitalRead(ENC_B_LEFT) == HIGH) encoderCountLeft++;
+  else                                  encoderCountLeft--;
+}
+
+// Atomic snapshot of both encoder counts (called from main loop)
+long encoderAvg() {
+  noInterrupts();
+  long r = encoderCountRight;
+  long l = encoderCountLeft;
+  interrupts();
+  return (r + l) / 2;
+}
+
+// ── State machine ────────────────────────────────────────────────────────────
+enum RobotState { STATE_LEARNING, STATE_RACING };
+RobotState robotState = STATE_LEARNING;
+
+// Encoder count at the beginning of the current lap
+long lapStartEncoder = 0;
+
+// Distance travelled since the start of this lap (encoder ticks)
+inline long lapPosition() { return encoderAvg() - lapStartEncoder; }
+
+// ── Turn log ─────────────────────────────────────────────────────────────────
+struct TurnEvent {
+  long lapPos;      // Encoder ticks from lap start when turn began
+  int  direction;   // > 0 means right turn, < 0 means left turn
+};
+
+const int MAX_TURNS = 60;
+TurnEvent turnLog[MAX_TURNS];
+int turnCount = 0;
+int nextTurnIdx = 0; // index into turnLog for the next upcoming turn (racing mode)
+
+// Turn detection state
+bool  inTurn            = false;
+long  turnStartPos      = 0;
+const int TURN_THRESHOLD = 2000; // |error| above this = we are in a turn
+
+// ── Lap-completion detection ──────────────────────────────────────────────────
+// The start/finish is marked by a thick black stripe that places all sensors on
+// the line at the same time (all sensorValues[] high after calibration).
+const uint16_t LAP_SENSOR_THRESHOLD  = 800;  // calibrated value above which sensor is "on black"
+const long     LAP_MIN_TICKS         = 2000; // minimum ticks before we check for lap end
+bool lapDetectionArmed = false; // armed once we've travelled LAP_MIN_TICKS
+
+// ── Pre-brake parameters ──────────────────────────────────────────────────────
+const long    PRE_BRAKE_TICKS  = 250; // slow down this many ticks before a logged turn
+const uint8_t APPROACH_SPEED   = 170; // speed during the pre-brake phase
+
 void rightMotor(int motorSpeed);
 void leftMotor(int motorSpeed);
 void PID_control();
+void checkLapCompletion();
+void detectTurn(int error);
+void printTurnLog();
 
 void setup()
 {
@@ -68,6 +137,15 @@ void setup()
   ledcAttachPin(PWMA, PWMA_channel);
   ledcSetup(PWMB_channel, PWM_freq, PWM_resolution);
   ledcAttachPin(PWMB, PWMB_channel);
+
+  // Encoder pins – GPIO 34-39 are input-only (no internal pull-up needed
+  // because the Pololu 5157 encoder has push-pull outputs).
+  pinMode(ENC_A_RIGHT, INPUT);
+  pinMode(ENC_B_RIGHT, INPUT);
+  pinMode(ENC_A_LEFT,  INPUT);
+  pinMode(ENC_B_LEFT,  INPUT);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_RIGHT), rightEncoderISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_LEFT),  leftEncoderISR,  RISING);
 
   // Ensure motors are stopped during calibration
   digitalWrite(AIN1, LOW);
@@ -212,6 +290,13 @@ void setup()
   digitalWrite(LED_BUILTIN, LOW);
   Serial.println("Calibration complete! Starting in soon");
   delay(500);
+
+  // Reset encoder counts and lap reference so the first lap starts at 0
+  encoderCountRight = 0;
+  encoderCountLeft  = 0;
+  lapStartEncoder   = 0;
+  lapDetectionArmed = false;
+  Serial.println("LEARNING LAP – logging turn positions");
 /* // Tester det over fra der det står test
   Serial.println("Calibrating");
   for (uint16_t i = 0; i < 400; i++)
@@ -240,6 +325,7 @@ void setup()
 
 void loop()
 {
+  checkLapCompletion();
   PID_control();
 }
 
@@ -260,30 +346,42 @@ void PID_control()
 
   int motorSpeedA = baseSpeedA + motorspeed;
   int motorspeedB = baseSpeedB - motorspeed;
-  /*
-  Serial.print("HøyreM=");
-  Serial.println(motorSpeedA);
-  Serial.print("VenstreM=");
-  Serial.println(motorspeedB);
-  */
+
   if (motorSpeedA > maxSpeedA) motorSpeedA = maxSpeedA;
   if (motorspeedB > maxSpeedB) motorspeedB = maxSpeedB;
   if (motorSpeedA < 0) motorSpeedA = -100;
   if (motorspeedB < 0) motorspeedB = -100;
 
-  //test
-  /*
-  if (error == -5000) {
-    leftMotor(maxSpeedB);
-    rightMotor(-100);
+  // ── Learning lap: log turns based on PID error ───────────────────────────
+  if (robotState == STATE_LEARNING) {
+    detectTurn(error);
   }
-  if (error == 5000) {
-    leftMotor(-100);
-    rightMotor(motorSpeedA);
+
+  // ── Racing laps: pre-brake before logged turns ───────────────────────────
+  bool approachingTurn = false;
+  if (robotState == STATE_RACING) {
+    long pos = lapPosition();
+    // Advance past turns we have already completed
+    while (nextTurnIdx < turnCount && pos > turnLog[nextTurnIdx].lapPos) {
+      nextTurnIdx++;
+    }
+    // Check if the very next turn is within the pre-brake window
+    if (nextTurnIdx < turnCount) {
+      long dist = turnLog[nextTurnIdx].lapPos - pos;
+      if (dist > 0 && dist <= PRE_BRAKE_TICKS) {
+        approachingTurn = true;
+      }
+    }
   }
-*/
-  // Sjekker om bilen er innenfor rangen
-  if ((error >= -1000) && (error <= 1000)) {
+
+  if (approachingTurn) {
+    // Slow both motors to APPROACH_SPEED while still applying PID steering
+    int scaledA = (motorSpeedA > 0) ? min((int)APPROACH_SPEED, motorSpeedA) : motorSpeedA;
+    int scaledB = (motorspeedB > 0) ? min((int)APPROACH_SPEED, motorspeedB) : motorspeedB;
+    rightMotor(scaledA);
+    leftMotor(scaledB);
+  } else if ((error >= -1000) && (error <= 1000)) {
+    // Sjekker om bilen er innenfor rangen
     if (!inStraightRange) {
       // Starter tiden
       straightStartTime = millis();
@@ -348,4 +446,86 @@ void leftMotor(int motorSpeed)
   }
   uint8_t pwm = (uint8_t)min(255, abs(motorSpeed));
   ledcWrite(PWMB_channel, pwm);
+}
+
+// ── detectTurn ───────────────────────────────────────────────────────────────
+// Called every PID cycle during the learning lap.
+// Records the lap-encoder position and direction when a turn begins.
+void detectTurn(int error)
+{
+  if (abs(error) > TURN_THRESHOLD) {
+    if (!inTurn) {
+      inTurn       = true;
+      turnStartPos = lapPosition();
+      if (turnCount < MAX_TURNS) {
+        turnLog[turnCount].lapPos    = turnStartPos;
+        turnLog[turnCount].direction = (error > 0) ? 1 : -1;
+        Serial.print("Turn #");
+        Serial.print(turnCount + 1);
+        Serial.print(" detected at pos=");
+        Serial.print(turnStartPos);
+        Serial.println((error > 0) ? " [RIGHT]" : " [LEFT]");
+        turnCount++;
+      }
+    }
+  } else {
+    inTurn = false;
+  }
+}
+
+// ── checkLapCompletion ───────────────────────────────────────────────────────
+// Detects the start/finish line (all sensors on the black stripe) after a
+// minimum distance, then transitions from learning to racing or resets the
+// lap reference for the next racing lap.
+void checkLapCompletion()
+{
+  long pos = lapPosition();
+
+  // Arm detection once the robot has travelled far enough from the start
+  if (!lapDetectionArmed && pos > LAP_MIN_TICKS) {
+    lapDetectionArmed = true;
+  }
+
+  if (!lapDetectionArmed) return;
+
+  // Check if all sensors are on the black start/finish stripe
+  bool allBlack = true;
+  for (uint8_t i = 0; i < SensorCount; i++) {
+    if (sensorValues[i] < LAP_SENSOR_THRESHOLD) {
+      allBlack = false;
+      break;
+    }
+  }
+  if (!allBlack) return;
+
+  // ── Lap complete ────────────────────────────────────────────────────────
+  if (robotState == STATE_LEARNING) {
+    Serial.println("=== LEARNING LAP COMPLETE ===");
+    printTurnLog();
+    robotState = STATE_RACING;
+    Serial.println("Switching to RACING mode");
+  } else {
+    Serial.print("Racing lap complete. Lap ticks=");
+    Serial.println(pos);
+  }
+
+  // Reset lap reference
+  lapStartEncoder   = encoderAvg();
+  lapDetectionArmed = false;
+  nextTurnIdx       = 0; // restart turn scan from the beginning each lap
+}
+
+// ── printTurnLog ─────────────────────────────────────────────────────────────
+void printTurnLog()
+{
+  Serial.print("Logged ");
+  Serial.print(turnCount);
+  Serial.println(" turns:");
+  for (int t = 0; t < turnCount; t++) {
+    Serial.print("  Turn ");
+    Serial.print(t + 1);
+    Serial.print(": pos=");
+    Serial.print(turnLog[t].lapPos);
+    Serial.println(turnLog[t].direction > 0 ? " RIGHT" : " LEFT");
+  }
 }
